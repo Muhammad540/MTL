@@ -5,7 +5,7 @@ mmap_ring.h: Linux memory mapped circular buffer with repeated views
 Overview:
 ---------
 
-Aa circular buffer tha appears linear to the CPU by mapping the same physical memory multiple times at consecutive virtual addresses
+Aa circular buffer that appears linear to the CPU by mapping the same physical memory multiple times at consecutive virtual addresses
 
     [view0 (0...N-1)] [view1 (N...2N-1)]
 
@@ -16,8 +16,10 @@ The second view is just used as a temporary spill over.
 
 #ifndef MMAP_RING_H
 #define MMAP_RING_H
+#include <asm-generic/errno-base.h>
 #include <errno.h>
 #include <stdint.h>
+#include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -32,10 +34,15 @@ typedef size_t st;
 typedef struct mmap_ring {
     // Mapped address of the first view 
     u8* base;
+    // usable mem in bytes 
     st capacity;
+    // rounded up to page size 
     st view_size;
+    // number of copies you want to have for your mem allocation in the VAS
     int replicas;
+    // total size is just replicas * view_size 
     st total_size;
+    // physical memory file descriptor 
     int fd;
     std::atomic<u64> head;
     std::atomic<u64> tail;
@@ -44,10 +51,12 @@ typedef struct mmap_ring {
 // Utility 
 
 static inline st mr_round_up(st x, st align) {
+    // rounds up to the multiple of align 
     return (x + align - 1) & ~(align - 1);
 }
 
 static inline st mr_pagesize(void) {
+    // gives the page size for your system
     long ps = sysconf(_SC_PAGESIZE);
     return (ps > 0) ? (st)ps : 4096;
 }
@@ -58,6 +67,7 @@ static void* mr_reserve_region(st size) {
 }
 
 static int mr_backing_fd_create(st size, int* out_fd) {
+    // creating backing mem actually means allocating a fixed size storage on the physical RAM
     int fd = memfd_create("mmap_ring", MFD_CLOEXEC);
     if (fd >= 0) {
         if (ftruncate(fd, (off_t)size) != 0) {
@@ -68,16 +78,18 @@ static int mr_backing_fd_create(st size, int* out_fd) {
         *out_fd = fd;
         return 0;
     }
-    std::cout << "Failed to create memory backing fd" << std::endl;
+    std::cerr << "Failed to create memory backing fd" << std::endl;
     return -1;
 }
 
 static int mr_map_replicas(void* base, int fd, st view_size, int replicas) {
     for (int i=0; i < replicas; i++) {
         u8* addr = (u8*)base + (st)i*view_size;
+        // create replicas for the virtual address space and map it to the same physical fd 
         void *p = mmap(addr, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
         if (p == MAP_FAILED) {
             int e = errno;
+            // only unmap the region that was already mapped 
             for (int j=0; j < i; ++j) {
                 munmap((u8*)base + (st)j*view_size, view_size);
             }
@@ -93,6 +105,73 @@ typedef struct mmap_ring_config {
     int replicas;
 } mmap_ring_config;
 
+static int mmap_ring_create(const mmap_ring_config* cfg, mmap_ring* out) {
+    if (!cfg || !out || cfg->capacity==0) {
+        return -1;
+    }
+
+    st ps = mr_pagesize();
+    st view_size = mr_round_up(cfg->capacity, ps);
+    int replicas = (cfg->replicas >= 2) ? cfg->replicas : 2;
+    st total_size = view_size * (st)replicas;
+
+    memset(out, 0, sizeof(*out));
+    out->replicas = replicas;
+    out->capacity = view_size;
+    out->total_size = total_size;
+
+    int fd = -1;
+    int err = mr_backing_fd_create(view_size, &fd);
+    if (err != 0) {
+        return err;
+    }
+
+    //!TODO: should we reserve first and then replicate ? 
+    void* base = mr_reserve_region(total_size);
+    if (base == MAP_FAILED) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+
+    err = mr_map_replicas(base, fd, view_size, replicas);
+    if (err != 0) {
+        munmap(base, total_size);
+        close(fd);
+        return err;
+    }
+
+    out->base = (u8*)base;
+    out->fd = fd;
+    out->head.store(0);
+    out->tail.store(0);
+    std::cout << "MMAP Ring Creation SUCCESS !" << std::endl;
+    return 0;
+}
+
+static void mmap_ring_destroy(mmap_ring* r) {
+    if (!r || !r->base) {
+        return;
+    }
+    munmap(r->base, r->total_size);
+    if (r->fd >= 0) {
+        close(r->fd);
+    }
+    memset(r, 0, sizeof(*r));
+}
+
+static inline st mmap_ring_readable(const mmap_ring* r) {
+    u64 h = r->head.load();
+    u64 t = r->tail.load();
+}
+
+static inline st mmap_ring_writeable(const mmap_ring* r) {
+    return r->capacity - mmap_ring_readable(r);
+}
+
+// Contiguous region to write up to max bytes
+static inline u8* mmap_ring_acquire(mmap_ring* r, st max_bytes, st* out_granted) {
+}
 
 #ifdef MMAP_RING_DEMO
 #include <time.h>
