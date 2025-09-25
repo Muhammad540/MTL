@@ -163,6 +163,7 @@ static void mmap_ring_destroy(mmap_ring* r) {
 static inline st mmap_ring_readable(const mmap_ring* r) {
     u64 h = r->head.load();
     u64 t = r->tail.load();
+    return (st)(h - t);
 }
 
 static inline st mmap_ring_writeable(const mmap_ring* r) {
@@ -170,8 +171,70 @@ static inline st mmap_ring_writeable(const mmap_ring* r) {
 }
 
 // Contiguous region to write up to max bytes
-static inline u8* mmap_ring_acquire(mmap_ring* r, st max_bytes, st* out_granted) {
+static inline u8* mmap_ring_write_acquire(mmap_ring* r, st max_bytes, st* out_granted) {
+    st avail = mmap_ring_writeable(r);
+    st grant = (max_bytes <= avail) ? max_bytes : avail;
+
+    if (grant == 0) {
+        if (out_granted) {
+            *out_granted = 0;
+            return NULL;
+        }
+    }
+    u64 h = r->head.load();
+    // head pointer increases monotically so wrapping is needed here
+    st off = (st)(h % r->capacity);
+    if (out_granted) {
+        *out_granted = grant;
+    }
+    return r->base + off;
 }
+
+// commit only the required memory
+static inline void mmap_ring_write_commit(mmap_ring* r, st count) {
+    u64 h = r->head.load();
+    r->head.store(h+count);
+}
+
+static inline u8* mmap_ring_write_acquire_overwrite(mmap_ring* r, st max_bytes, st* out_grant) {
+    st readable = mmap_ring_readable(r);
+    if (max_bytes > r->capacity) {
+        max_bytes = r->capacity;
+    }
+
+    st needed = max_bytes;
+    st writeable = r->capacity - readable;
+    if (needed > writeable) {
+        st drop = needed - writeable;
+        u64 t = r->tail.load();
+        r->tail.store(t+drop);
+    }
+    return mmap_ring_write_acquire(r, max_bytes, out_grant);
+}
+
+static inline const u8* mmap_ring_read_acquire(mmap_ring* r, st max_bytes, st* out_grant) {
+    st avail = mmap_ring_readable(r);
+    st grant = (max_bytes <= avail) ? max_bytes : avail;
+    if (grant == 0) {
+        if (out_grant) {
+            *out_grant = 0;
+            return NULL;
+        }
+    }
+
+    u64 t = r->tail.load();
+    // tail ptr increases monotonically so we have to wrap back
+    st off = (st)(t % r->capacity);
+    if (out_grant) {
+        *out_grant = grant;
+    }
+    return r->base + off;
+}
+
+static inline void mmap_ring_read_commit(mmap_ring* r, st count) {
+    u64 t = r->tail.load();
+    r->tail.store(t+count);
+} 
 
 #ifdef MMAP_RING_DEMO
 #include <time.h>
